@@ -1,0 +1,104 @@
+name: Build and verify free hosting package
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: free-hosting-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install Python dependencies
+        run: python -m pip install -r backend/requirements-dev.txt
+      - name: Backend tests
+        working-directory: backend
+        run: python -m pytest -q
+      - name: Deployment helper tests
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Build the actual frontend
+        working-directory: frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          npx playwright install --with-deps chromium
+      - name: Start built app with the hosting database mode
+        env:
+          DATA_DIR: ${{ runner.temp }}/signal-test-data
+          SQLITE_JOURNAL_MODE: DELETE
+        run: |
+          nohup python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --workers 1 > /tmp/signal-app.log 2>&1 &
+          python - <<'PY'
+          import time, urllib.request
+          for attempt in range(60):
+              try:
+                  urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()
+                  break
+              except Exception:
+                  time.sleep(1)
+          else:
+              raise SystemExit('Backend did not become ready; see /tmp/signal-app.log')
+          PY
+      - name: Browser tests against the built app
+        working-directory: frontend
+        run: npm run test:e2e
+      - name: Hosted smoke-check script, using local server
+        run: python scripts/smoke_hosted.py http://127.0.0.1:8000 --allow-local
+      - name: Package frontend export and backend
+        run: python scripts/package_hosting.py
+      - name: Upload checked runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosting-runtime
+          path: release/
+          retention-days: 3
+      - name: Show backend logs on failure
+        if: failure()
+        run: cat /tmp/signal-app.log 2>/dev/null || true
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hosting-runtime
+          path: release
+      - name: Publish checked hosting release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          TAG="deploy-${SOURCE_SHA}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists for this commit; leaving it unchanged."
+          else
+            gh release create "$TAG" release/signal-hosting.zip release/signal-hosting.sha256 \
+              --target "$SOURCE_SHA" --latest \
+              --title "Checked hosting build ${SOURCE_SHA:0:8}" \
+              --notes "Built from the public source. Backend, deployment-helper, TypeScript, production-build, browser, and HTTP/WebSocket smoke checks passed. Deploy using scripts/deploy_pythonanywhere.py."
+          fi
