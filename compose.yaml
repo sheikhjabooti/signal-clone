@@ -1,0 +1,17 @@
+services:
+  signal:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /var/data
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DEMO_OTP: ${DEMO_OTP:-123456}
+      SEED_DEMO: ${SEED_DEMO:-true}
+      PORT: "8000"
+    volumes:
+      - signal-data:/var/data
+    restart: unless-stopped
+volumes:
+  signal-data:
